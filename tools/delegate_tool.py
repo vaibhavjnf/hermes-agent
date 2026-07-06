@@ -312,6 +312,20 @@ def _looks_like_error_output(content: Any) -> bool:
     if not content:
         return False
 
+    # Tool-result content may be a list of structured blocks, not a string.
+    # Coerce before string heuristics or ``.lstrip()`` crashes the (sub)agent.
+    # (hermes-claude-oauth-fix skill)
+    if not isinstance(content, str):
+        if isinstance(content, list):
+            content = "\n".join(
+                b.get("text", "") if isinstance(b, dict) else str(b)
+                for b in content
+            )
+        else:
+            content = str(content)
+    if not content:
+        return False
+
     head = content.lstrip()
     if head.startswith("{") or head.startswith("["):
         try:

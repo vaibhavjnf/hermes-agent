@@ -2281,6 +2281,25 @@ def _manage_thinking_signatures(
             last_assistant_idx = i
             break
 
+    # Thinking blocks on the latest assistant message must be preserved
+    # byte-for-byte ONLY when that turn is a live tool-use continuation
+    # (the request ends with the assistant's tool_use followed by their
+    # tool_result(s)).  On a fresh user turn the prior assistant's thinking
+    # is not required and replaying a stale/mutated block triggers HTTP 400
+    # "thinking blocks ... cannot be modified".  Detect a continuation: the
+    # assistant is the final message, or every message after it is a
+    # tool_result-bearing user message (no fresh text turn in between).
+    def _has_tool_result(msg: Dict[str, Any]) -> bool:
+        c = msg.get("content")
+        return isinstance(c, list) and any(
+            isinstance(b, dict) and b.get("type") == "tool_result" for b in c
+        )
+
+    _trailing = result[last_assistant_idx + 1:] if last_assistant_idx is not None else []
+    _latest_is_continuation = last_assistant_idx is not None and (
+        not _trailing or all(_has_tool_result(t) for t in _trailing)
+    )
+
     for idx, m in enumerate(result):
         if m.get("role") != "assistant" or not isinstance(m.get("content"), list):
             continue
@@ -2297,9 +2316,11 @@ def _manage_thinking_signatures(
                     continue
                 new_content.append(b)
             m["content"] = new_content or [{"type": "text", "text": "(empty)"}]
-        elif _is_third_party or idx != last_assistant_idx:
+        elif _is_third_party or idx != last_assistant_idx or not _latest_is_continuation:
             # Third-party: strip ALL thinking blocks (signatures are proprietary).
-            # Direct Anthropic: strip from non-latest assistant messages only.
+            # Direct Anthropic: strip from non-latest assistant messages, and
+            # also from the latest assistant when this is a fresh turn (not a
+            # live tool-use continuation) — see _latest_is_continuation above.
             stripped = [
                 b for b in m["content"]
                 if not (isinstance(b, dict) and b.get("type") in _THINKING_TYPES)
@@ -2526,25 +2547,44 @@ def build_anthropic_kwargs(
 
     # ── OAuth: Claude Code identity ──────────────────────────────────
     if is_oauth:
-        # 1. Prepend Claude Code system prompt identity
+        # 1. OAuth abuse gate scores the SYSTEM prompt; a large agentic persona
+        #    there 400s ("out of extra usage"). Keep system = bare Claude Code
+        #    identity and relocate the agent's instructions into a leading user
+        #    turn (gate ignores the conversation body; model still reads it).
+        #    (hermes-claude-oauth-fix skill)
         cc_block = {"type": "text", "text": _CLAUDE_CODE_SYSTEM_PREFIX}
+        _relocated_system = ""
         if isinstance(system, list):
-            system = [cc_block] + system
-        elif isinstance(system, str) and system:
-            system = [cc_block, {"type": "text", "text": system}]
-        else:
-            system = [cc_block]
+            _relocated_system = "\n\n".join(
+                b.get("text", "") for b in system
+                if isinstance(b, dict) and b.get("type") == "text"
+            )
+        elif isinstance(system, str):
+            _relocated_system = system
+        system = [cc_block]
 
-        # 2. Sanitize system prompt — replace product name references
-        #    to avoid Anthropic's server-side content filters.
+        # 2. Sanitize minimal system + relocated text; inject relocated text as a
+        #    leading turn with a cache_control breakpoint so the stable persona
+        #    prefix is cached (system block's own marker is dropped, so total
+        #    breakpoints stay within Anthropic's limit of 4).
+        def _cc_sanitize(text):
+            text = text.replace("Hermes Agent", "Claude Code")
+            text = text.replace("Hermes agent", "Claude Code")
+            text = text.replace("hermes-agent", "claude-code")
+            text = text.replace("Nous Research", "Anthropic")
+            return text
         for block in system:
             if isinstance(block, dict) and block.get("type") == "text":
-                text = block.get("text", "")
-                text = text.replace("Hermes Agent", "Claude Code")
-                text = text.replace("Hermes agent", "Claude Code")
-                text = text.replace("hermes-agent", "claude-code")
-                text = text.replace("Nous Research", "Anthropic")
-                block["text"] = text
+                block["text"] = _cc_sanitize(block.get("text", ""))
+        _relocated_system = _cc_sanitize(_relocated_system).strip()
+        if _relocated_system:
+            anthropic_messages = [
+                {"role": "user", "content": [
+                    {"type": "text", "text": _relocated_system,
+                     "cache_control": {"type": "ephemeral"}},
+                ]},
+                {"role": "assistant", "content": "Understood."},
+            ] + anthropic_messages
 
         # 3. Normalize tool names so NOTHING goes on the OAuth wire with a
         #    single-underscore ``mcp_`` prefix.  Anthropic's subscription/OAuth

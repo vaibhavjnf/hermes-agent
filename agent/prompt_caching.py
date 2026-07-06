@@ -44,9 +44,17 @@ def _apply_cache_marker(msg: dict, cache_marker: dict, native_anthropic: bool = 
         return
 
     if isinstance(content, list) and content:
-        last = content[-1]
-        if isinstance(last, dict):
-            last["cache_control"] = cache_marker
+        # cache_control must NOT be placed on a thinking/redacted_thinking
+        # block: Anthropic signs those blocks and rejects any mutation with
+        # HTTP 400 "thinking blocks ... cannot be modified". With interleaved
+        # thinking the latest assistant turn can *end* with a thinking block,
+        # so content[-1] is not always safe. Mark the last non-thinking block
+        # instead; if the message is thinking-only, skip the breakpoint.
+        _THINKING = {"thinking", "redacted_thinking"}
+        for block in reversed(content):
+            if isinstance(block, dict) and block.get("type") not in _THINKING:
+                block["cache_control"] = cache_marker
+                return
 
 
 def _can_carry_marker(msg: dict, native_anthropic: bool) -> bool:
