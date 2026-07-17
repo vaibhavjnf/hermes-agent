@@ -49,6 +49,7 @@ from hermes_time import now as _hermes_now
 logger = logging.getLogger(__name__)
 
 _SCRIPT_TERMINATION_GRACE = 5
+_SCRIPT_FORCE_KILL = getattr(signal, "SIGKILL", signal.SIGTERM)
 
 
 def _summarize_cron_failure_for_delivery(job: dict, error: str | None) -> str:
@@ -2047,9 +2048,12 @@ def _posix_descendant_groups(root_pid: int) -> set[int]:
 
 
 def _signal_process_groups(groups: set[int], sig: signal.Signals) -> None:
+    killpg = getattr(os, "killpg", None)
+    if killpg is None:
+        return
     for group in groups:
         try:
-            os.killpg(group, sig)
+            killpg(group, sig)
         except (ProcessLookupError, PermissionError):
             pass
 
@@ -2168,14 +2172,14 @@ def _run_job_script(script_path: str) -> tuple[bool, str]:
                     process.kill()
                 else:
                     groups.update(_posix_descendant_groups(process.pid))
-                    _signal_process_groups(groups, signal.SIGKILL)
+                    _signal_process_groups(groups, _SCRIPT_FORCE_KILL)
                 process.communicate()
             if sys.platform != "win32":
                 # A daemonized nested session may close the inherited pipes,
                 # making communicate() return although that session survived
                 # TERM.  The pre-TERM snapshot is therefore killed regardless
                 # of whether the grace wait itself timed out.
-                _signal_process_groups(groups, signal.SIGKILL)
+                _signal_process_groups(groups, _SCRIPT_FORCE_KILL)
             return False, f"Script timed out after {script_timeout}s: {path}"
 
         stdout = (stdout_raw or "").strip()
