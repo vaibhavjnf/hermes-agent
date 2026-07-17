@@ -195,6 +195,102 @@ class TestRunJobScript:
         assert success is False
         assert "timed out" in output.lower()
 
+    @pytest.mark.skipif(sys.platform == "win32", reason="POSIX process-group contract")
+    def test_script_timeout_kills_descendants_before_returning(self, cron_env, monkeypatch):
+        from cron import scheduler as sched_mod
+        from cron.scheduler import _run_job_script
+
+        monkeypatch.setattr(sched_mod, "_SCRIPT_TIMEOUT", 1)
+        marker = cron_env / "late-mutation.txt"
+        script = cron_env / "scripts" / "orphan.sh"
+        script.write_text(textwrap.dedent(f"""\
+            #!/bin/bash
+            (sleep 2; printf leaked > {str(marker)!r}) &
+            wait
+        """))
+
+        success, output = _run_job_script(str(script))
+        assert success is False
+        assert "timed out" in output.lower()
+        import time
+        time.sleep(2)
+        assert not marker.exists(), "timed-out descendant mutated state after scheduler returned"
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="POSIX nested-session contract")
+    @pytest.mark.live_system_guard_bypass
+    def test_script_timeout_kills_nested_setsid_child(self, cron_env, monkeypatch):
+        from cron import scheduler as sched_mod
+        from cron.scheduler import _run_job_script
+
+        monkeypatch.setattr(sched_mod, "_SCRIPT_TIMEOUT", 1)
+        monkeypatch.setattr(sched_mod, "_SCRIPT_TERMINATION_GRACE", 1)
+        marker = cron_env / "nested-late-mutation.txt"
+        child_pid = cron_env / "nested-child.pid"
+        nested_child = cron_env / "scripts" / "nested_child.py"
+        nested_child.write_text(textwrap.dedent(f"""\
+            import os
+            import signal
+            import time
+            from pathlib import Path
+            os.setsid()
+            signal.signal(signal.SIGTERM, signal.SIG_IGN)
+            time.sleep(3)
+            Path({str(marker)!r}).write_text("leaked")
+        """))
+        script = cron_env / "scripts" / "nested-session.sh"
+        script.write_text(textwrap.dedent(f"""\
+            #!/bin/bash
+            {sys.executable} {nested_child} &
+            printf '%s' "$!" > {child_pid}
+            wait
+        """))
+
+        success, output = _run_job_script(str(script))
+        assert success is False
+        assert "timed out" in output.lower()
+        pid = int(child_pid.read_text())
+        with pytest.raises(ProcessLookupError):
+            os.kill(pid, 0)
+        import time
+        time.sleep(2)
+        assert not marker.exists(), "nested setsid child mutated state after scheduler returned"
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="POSIX daemon-session contract")
+    @pytest.mark.live_system_guard_bypass
+    def test_script_timeout_kills_nested_child_that_closes_output_pipes(self, cron_env, monkeypatch):
+        from cron import scheduler as sched_mod
+        from cron.scheduler import _run_job_script
+
+        monkeypatch.setattr(sched_mod, "_SCRIPT_TIMEOUT", 1)
+        marker = cron_env / "daemon-late-mutation.txt"
+        nested_child = cron_env / "scripts" / "daemon_child.py"
+        nested_child.write_text(textwrap.dedent(f"""\
+            import os
+            import signal
+            import time
+            from pathlib import Path
+            os.setsid()
+            null = os.open(os.devnull, os.O_WRONLY)
+            os.dup2(null, 1)
+            os.dup2(null, 2)
+            signal.signal(signal.SIGTERM, signal.SIG_IGN)
+            time.sleep(2)
+            Path({str(marker)!r}).write_text("leaked")
+        """))
+        script = cron_env / "scripts" / "daemon-session.sh"
+        script.write_text(textwrap.dedent(f"""\
+            #!/bin/bash
+            {sys.executable} {nested_child} &
+            wait
+        """))
+
+        success, output = _run_job_script(str(script))
+        assert success is False
+        assert "timed out" in output.lower()
+        import time
+        time.sleep(2)
+        assert not marker.exists(), "daemonized nested child mutated state after timeout return"
+
     def test_script_json_output(self, cron_env):
         """Scripts can output structured JSON for the LLM to parse."""
         from cron.scheduler import _run_job_script

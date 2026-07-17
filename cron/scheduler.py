@@ -16,6 +16,7 @@ import json
 import logging
 import os
 import re
+import signal
 import shutil
 import subprocess
 import sys
@@ -46,6 +47,8 @@ from hermes_cli.fallback_config import get_fallback_chain
 from hermes_time import now as _hermes_now
 
 logger = logging.getLogger(__name__)
+
+_SCRIPT_TERMINATION_GRACE = 5
 
 
 def _summarize_cron_failure_for_delivery(job: dict, error: str | None) -> str:
@@ -2011,6 +2014,46 @@ def _get_script_timeout() -> int:
     return _DEFAULT_SCRIPT_TIMEOUT
 
 
+def _posix_descendant_groups(root_pid: int) -> set[int]:
+    """Snapshot process groups owned by a script tree, including nested sessions."""
+    groups: set[int] = set()
+    try:
+        rows = subprocess.run(
+            ["ps", "-axo", "pid=,ppid="], capture_output=True, text=True, check=True,
+        ).stdout.splitlines()
+        children: dict[int, list[int]] = {}
+        for row in rows:
+            pid_text, ppid_text = row.split()
+            children.setdefault(int(ppid_text), []).append(int(pid_text))
+        pending = [root_pid]
+        seen: set[int] = set()
+        while pending:
+            pid = pending.pop()
+            if pid in seen:
+                continue
+            seen.add(pid)
+            pending.extend(children.get(pid, ()))
+            try:
+                groups.add(os.getpgid(pid))
+            except ProcessLookupError:
+                pass
+    except (OSError, subprocess.SubprocessError, ValueError):
+        try:
+            groups.add(os.getpgid(root_pid))
+        except (ProcessLookupError, PermissionError):
+            pass
+    groups.discard(os.getpgrp())
+    return groups
+
+
+def _signal_process_groups(groups: set[int], sig: signal.Signals) -> None:
+    for group in groups:
+        try:
+            os.killpg(group, sig)
+        except (ProcessLookupError, PermissionError):
+            pass
+
+
 def _run_job_script(script_path: str) -> tuple[bool, str]:
     """Execute a cron job's data-collection script and capture its output.
 
@@ -2096,18 +2139,47 @@ def _run_job_script(script_path: str) -> tuple[bool, str]:
     try:
         from tools.environments.local import _sanitize_subprocess_env
 
-        popen_kwargs = {"creationflags": windows_hide_flags()} if sys.platform == "win32" else {}
-        result = subprocess.run(
+        popen_kwargs = (
+            {"creationflags": windows_hide_flags()}
+            if sys.platform == "win32"
+            else {"start_new_session": True}
+        )
+        process = subprocess.Popen(
             argv,
-            capture_output=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             text=True,
-            timeout=script_timeout,
             cwd=str(path.parent),
             env=_sanitize_subprocess_env(os.environ.copy()),
             **popen_kwargs,
         )
-        stdout = (result.stdout or "").strip()
-        stderr = (result.stderr or "").strip()
+        try:
+            stdout_raw, stderr_raw = process.communicate(timeout=script_timeout)
+        except subprocess.TimeoutExpired:
+            if sys.platform == "win32":
+                process.kill()
+            else:
+                groups = _posix_descendant_groups(process.pid)
+                _signal_process_groups(groups, signal.SIGTERM)
+            try:
+                process.communicate(timeout=_SCRIPT_TERMINATION_GRACE)
+            except subprocess.TimeoutExpired:
+                if sys.platform == "win32":
+                    process.kill()
+                else:
+                    groups.update(_posix_descendant_groups(process.pid))
+                    _signal_process_groups(groups, signal.SIGKILL)
+                process.communicate()
+            if sys.platform != "win32":
+                # A daemonized nested session may close the inherited pipes,
+                # making communicate() return although that session survived
+                # TERM.  The pre-TERM snapshot is therefore killed regardless
+                # of whether the grace wait itself timed out.
+                _signal_process_groups(groups, signal.SIGKILL)
+            return False, f"Script timed out after {script_timeout}s: {path}"
+
+        stdout = (stdout_raw or "").strip()
+        stderr = (stderr_raw or "").strip()
 
         # Redact secrets from both stdout and stderr before any return path.
         try:
@@ -2119,8 +2191,8 @@ def _run_job_script(script_path: str) -> tuple[bool, str]:
             stdout = "[REDACTED - redaction failed]"
             stderr = "[REDACTED - redaction failed]"
 
-        if result.returncode != 0:
-            parts = [f"Script exited with code {result.returncode}"]
+        if process.returncode != 0:
+            parts = [f"Script exited with code {process.returncode}"]
             if stderr:
                 parts.append(f"stderr:\n{stderr}")
             if stdout:
@@ -2129,8 +2201,6 @@ def _run_job_script(script_path: str) -> tuple[bool, str]:
 
         return True, stdout
 
-    except subprocess.TimeoutExpired:
-        return False, f"Script timed out after {script_timeout}s: {path}"
     except Exception as exc:
         return False, f"Script execution failed: {exc}"
 
