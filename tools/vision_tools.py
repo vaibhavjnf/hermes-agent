@@ -568,6 +568,14 @@ _EMBED_TARGET_BYTES = 4 * 1024 * 1024
 # images before they are embedded.
 _EMBED_MAX_DIMENSION = 7900
 
+# Native tool results have a much tighter budget than an API's image limit.
+# A 4 MB data URL is valid for Anthropic, but serializing it through an
+# OpenAI/Codex tool-result can add hundreds of thousands of input tokens and
+# make the next agent turn appear stalled.  Keep enough resolution for normal
+# screenshots while bounding the context cost of every native-vision call.
+_NATIVE_TOOL_RESULT_TARGET_BYTES = 768 * 1024
+_NATIVE_TOOL_RESULT_MAX_DIMENSION = 1920
+
 # Target size when auto-resizing on API failure (5 MB).  After a provider
 # rejects an image, we downscale to this target and retry once.
 _RESIZE_TARGET_BYTES = 5 * 1024 * 1024
@@ -1010,33 +1018,31 @@ async def _vision_analyze_native(
             temp_image_path, mime_type=detected_mime_type,
         )
 
-        # Proactive embed cap: this image gets baked into conversation
-        # history and re-sent on every subsequent turn.  Anthropic rejects
-        # any single base64 image over 5 MB OR over 8000px per side with a
-        # 400, and because history is immutable, an oversized embed
-        # permanently wedges the session — retries can't clear bytes (or
-        # pixels) that are already in the request.  Resize DOWN to the embed
-        # target (4 MB / 7900px, headroom under both ceilings) whenever the
-        # payload exceeds either limit, not just at the 20 MB hard ceiling.
-        _over_bytes = len(image_data_url) > _EMBED_TARGET_BYTES
+        # A native image becomes a tool result in immutable conversation
+        # history.  API safety allows 4 MB, but Codex/OpenAI tool-result
+        # serialization can turn that into a huge next-turn prompt.  Use the
+        # tighter native-tool budget so screenshots stay useful without
+        # stalling the agent loop.
+        _over_bytes = len(image_data_url) > _NATIVE_TOOL_RESULT_TARGET_BYTES
         _over_dims = await _run_encode_on_cpu_executor(
-            _image_exceeds_dimension, temp_image_path, _EMBED_MAX_DIMENSION,
+            _image_exceeds_dimension,
+            temp_image_path,
+            _NATIVE_TOOL_RESULT_MAX_DIMENSION,
         )
         if _over_bytes or _over_dims:
             image_data_url = await _run_encode_on_cpu_executor(
                 _resize_image_for_vision,
                 temp_image_path, mime_type=detected_mime_type,
-                max_base64_bytes=_EMBED_TARGET_BYTES,
-                max_dimension=_EMBED_MAX_DIMENSION,
+                max_base64_bytes=_NATIVE_TOOL_RESULT_TARGET_BYTES,
+                max_dimension=_NATIVE_TOOL_RESULT_MAX_DIMENSION,
             )
-            # If even resizing can't get under the absolute hard ceiling,
-            # there's nothing more we can do — reject rather than embed a
-            # session-wedging payload.
-            if len(image_data_url) > _MAX_BASE64_BYTES:
+            # Refuse a result that cannot meet the context budget.  Returning
+            # a valid-but-oversized data URL recreates the stalled-session bug.
+            if len(image_data_url) > _NATIVE_TOOL_RESULT_TARGET_BYTES:
                 return tool_error(
-                    f"Image too large for vision API: base64 payload is "
+                    f"Image too large for native tool result: base64 payload is "
                     f"{len(image_data_url) / (1024 * 1024):.1f} MB "
-                    f"(limit {_MAX_BASE64_BYTES / (1024 * 1024):.0f} MB) "
+                    f"(limit {_NATIVE_TOOL_RESULT_TARGET_BYTES / (1024 * 1024):.2f} MB) "
                     f"even after resizing. Install Pillow "
                     f"(`pip install Pillow`) for better auto-resize, "
                     f"or compress the image manually.",

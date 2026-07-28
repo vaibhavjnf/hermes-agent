@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+from io import BytesIO
 from unittest.mock import patch
 
 
@@ -158,7 +159,10 @@ class TestVisionAnalyzeNative:
         except ImportError:
             pytest.skip("Pillow not installed — proactive resize is a no-op")
 
-        from tools.vision_tools import _EMBED_TARGET_BYTES
+        from tools.vision_tools import (
+            _NATIVE_TOOL_RESULT_MAX_DIMENSION,
+            _NATIVE_TOOL_RESULT_TARGET_BYTES,
+        )
 
         # Noisy PNG that base64-encodes to well over 5 MB (won't compress much).
         big = tmp_path / "big.png"
@@ -174,10 +178,13 @@ class TestVisionAnalyzeNative:
             for p in result["content"]
             if p.get("type") == "image_url"
         )
-        assert len(url) <= _EMBED_TARGET_BYTES, (
-            f"embedded image {len(url) / 1024 / 1024:.1f} MB exceeds embed cap "
-            f"{_EMBED_TARGET_BYTES / 1024 / 1024:.0f} MB — would wedge sessions on Anthropic"
+        assert len(url) <= _NATIVE_TOOL_RESULT_TARGET_BYTES, (
+            f"native tool result {len(url) / 1024 / 1024:.1f} MB exceeds "
+            f"context budget {_NATIVE_TOOL_RESULT_TARGET_BYTES / 1024 / 1024:.2f} MB"
         )
+        payload = base64.b64decode(url.split(",", 1)[1])
+        with Image.open(BytesIO(payload)) as resized:
+            assert max(resized.size) <= _NATIVE_TOOL_RESULT_MAX_DIMENSION
 
 
 # ─── _handle_vision_analyze fast-path gating ─────────────────────────────────
