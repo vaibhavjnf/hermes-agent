@@ -74,6 +74,15 @@ def _make_runner():
     return runner
 
 
+def test_photon_connect_timeout_can_override_global_timeout(monkeypatch):
+    runner = _make_runner()
+    monkeypatch.setenv("HERMES_GATEWAY_PHOTON_CONNECT_TIMEOUT", "120")
+    monkeypatch.setenv("HERMES_GATEWAY_PLATFORM_CONNECT_TIMEOUT", "90")
+
+    assert runner._platform_connect_timeout_secs(Platform("photon")) == 120
+    assert runner._platform_connect_timeout_secs(Platform.TELEGRAM) == 90
+
+
 # --- Startup queueing ---
 
 class TestStartupPlatformIsolation:
@@ -852,4 +861,3 @@ class TestVoiceInputCallbackWiring:
         assert adapter._voice_input_callback is not None, (
             "startup must wire _voice_input_callback"
         )
-

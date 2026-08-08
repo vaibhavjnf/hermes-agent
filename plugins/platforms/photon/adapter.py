@@ -737,6 +737,13 @@ class PhotonAdapter(BasePlatformAdapter):
             os.getenv("PHOTON_SIDECAR_AUTOSTART", "true")
         ).lower() not in ("0", "false", "no")
         self._node_bin = os.getenv("PHOTON_NODE_BIN") or shutil.which("node") or "node"
+        self._sidecar_ready_timeout = _coerce_float(
+            _first_set(
+                extra.get("sidecar_ready_timeout_seconds"),
+                os.getenv("PHOTON_SIDECAR_READY_TIMEOUT_SECONDS"),
+            ),
+            15.0,
+        )
 
         # Presence watchdog. spectrum-ts only reconnects when its inbound
         # iterator throws or ends; a half-open ("zombie") gRPC socket makes the
@@ -1661,8 +1668,9 @@ class PhotonAdapter(BasePlatformAdapter):
             self._supervise_sidecar(self._sidecar_proc)
         )
 
-        # Wait for /healthz to come up — give it up to 15s on cold start.
-        deadline = time.time() + 15.0
+        # Wait for /healthz to come up. Default remains 15s, while an
+        # overloaded host can raise this through platform configuration.
+        deadline = time.time() + self._sidecar_ready_timeout
         last_err: Optional[Exception] = None
         async with httpx.AsyncClient(timeout=2.0, trust_env=False) as client:
             while time.time() < deadline:
@@ -1692,7 +1700,8 @@ class PhotonAdapter(BasePlatformAdapter):
                 await asyncio.sleep(0.2)
         _delete_runtime_record()
         raise RuntimeError(
-            f"Photon sidecar did not become ready within 15s: {last_err}"
+            "Photon sidecar did not become ready within "
+            f"{self._sidecar_ready_timeout:g}s: {last_err}"
         )
 
     async def _supervise_sidecar(self, proc: subprocess.Popen) -> None:

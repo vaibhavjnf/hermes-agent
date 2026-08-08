@@ -25,6 +25,27 @@ def _make_adapter(monkeypatch: pytest.MonkeyPatch) -> PhotonAdapter:
     return PhotonAdapter(cfg)
 
 
+def test_sidecar_ready_timeout_uses_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("PHOTON_SIDECAR_READY_TIMEOUT_SECONDS", "45")
+
+    assert _make_adapter(monkeypatch)._sidecar_ready_timeout == 45
+
+
+def test_sidecar_ready_timeout_config_wins_over_env(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("PHOTON_PROJECT_ID", "test-project-id")
+    monkeypatch.setenv("PHOTON_PROJECT_SECRET", "test-project-secret")
+    monkeypatch.setenv("PHOTON_SIDECAR_READY_TIMEOUT_SECONDS", "45")
+    cfg = PlatformConfig(
+        enabled=True,
+        token="",
+        extra={"sidecar_ready_timeout_seconds": 60},
+    )
+
+    assert PhotonAdapter(cfg)._sidecar_ready_timeout == 60
+
+
 class _ProbeClient:
     """Fake httpx.AsyncClient whose /healthz probe behavior is injectable."""
 

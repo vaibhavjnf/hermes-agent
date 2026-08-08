@@ -6639,6 +6639,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
     def _platform_connect_timeout_secs(self, platform=None) -> float:
         """Return the per-platform connect timeout used during startup/retry."""
+        if getattr(platform, "value", None) == "photon":
+            raw = os.getenv("HERMES_GATEWAY_PHOTON_CONNECT_TIMEOUT", "").strip()
+            if raw:
+                try:
+                    timeout = float(raw)
+                except ValueError:
+                    logger.warning(
+                        "Ignoring invalid HERMES_GATEWAY_PHOTON_CONNECT_TIMEOUT=%r",
+                        raw,
+                    )
+                else:
+                    return max(0.0, timeout)
         raw = os.getenv("HERMES_GATEWAY_PLATFORM_CONNECT_TIMEOUT", "").strip()
         if raw:
             try:
