@@ -233,6 +233,13 @@ class TestGeneratedSystemdUnits:
         assert str(local_bin) in plist
         assert str(profile_node_bin) not in plist
 
+    def test_launchd_plist_marks_wrapped_gateway_as_supervised(self):
+        """The stderr wrapper can lose launchd's XPC_SERVICE_NAME marker."""
+        plist = gateway_cli.generate_launchd_plist()
+
+        assert "<key>HERMES_GATEWAY_EXTERNAL_SUPERVISOR</key>" in plist
+        assert "<string>1</string>" in plist
+
     def test_launchd_plist_persists_configured_nofile_soft_limit(self, monkeypatch):
         """The generated plist must carry SoftResourceLimits/NumberOfFiles so a
         plist rewrite by `hermes gateway start` cannot strip the FD floor and
